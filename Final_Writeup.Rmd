@@ -1,0 +1,405 @@
+---
+title: "Forest Cover Type Prediction"
+author: "Ryan Moerer"
+date: "6/7/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, error = TRUE, message = FALSE, warning = FALSE)
+
+library(tidyverse)
+library(tidymodels)
+
+train <- read_csv("./Data/train.csv") %>% select(Cover_Type, everything())
+test <- read_csv("./Data/test.csv")
+
+set.seed(145)
+```
+
+## Introduction
+
+Being, on occasion, a hiker, I have at multiple times in my life taking in a tree or a plant and wondered to myself, "Hmmm... what is that?" Of course, not being a nature expert, the answer to that question has most often been "I don't know". But what if I happened to be carrying my laptop on my hike? Could I measure a couple variables, plug them into my computer, and then predict with some level of accuracy what exactly it is I am staring at? Well, thanks to the good people at Kaggle I now (theoretically) can! Kaggle often puts on playground competitions, where participants compete to train a model that best predicts on some sort of test dataset. One particular competition that was offered years ago was in regards to forest cover type in which participants were asked to predict one of seven cover types based on a set of variables. Due to the fascinating topic and the obvious connection to tree-based models I thought that this competition would be one that would be particularly fun and also a great opportunity to showcase my general model-building process. And so, through the use of this competition and several tree-based models, I will do just that. In doing so, I will attempt to outline my modeling process and explain in detail how I explore the dataset, fit the models, and finally make predictions.
+
+## The Data
+
+The first thing I always want to do when attempting to model something is get to know my data. Before I dive right in, lets get a brief overview of how the data was collected and what is included in our dataset. First and foremost, the basic setup of Kaggle competitions is that you are given a training dataset, the data you train your models with, and a test dataset, the data you test your model predictions against. In order to avoid overfitting, I will focus my data exploration on the training dataset. However, just know that 15,120 observations are included in the training set and 565,892 observations are included in the test set. Okay, now that we have those caveats out of the way, lets explore the training set itself. According to Kaggle, the data was collected in a study across four wilderness areas located in the Roosevelt National Forest of northern Colorado. In the dataset, there are seven types of forest cover: 
+
+* Spruce/Fir (Encoded as 1)
+* Lodgepole Pine (Encoded as 2)
+* Ponderosa Pine (Encoded as 3)
+* Cottonwood/Willow (Encoded as 4)
+* Aspen (Encoded as 5)
+* Douglas-fir (Encoded as 6)
+* Krummholz (Encoded as 7)
+
+These forest cover types will ultimately be what we are trying to predict. As for possible predictor variables, there are a variety of other variables included in the dataset, such as continuous variables like elevation and slope as well as dummy variables for things like soil type and are of the wilderness. To get a further understanding of what exactly all the variables are measuring you can look at the Kaggle data page itself [here](https://www.kaggle.com/c/forest-cover-type-prediction/data). Okay now that we have had a brief overview of the data collection process, lets dive into the dataset itself through the use of the `summary` function available to us in R.
+
+```{r}
+# read in training data
+train <- read_csv("./Data/train.csv") %>% select(Cover_Type, everything())
+
+# summarize the data
+summary(train) %>% 
+  kableExtra::kable() %>%
+  kableExtra::kable_styling() %>%
+  kableExtra::scroll_box(width = "100%")
+
+# check for NAs
+sum(is.na(train))
+```
+
+Here we get a glimpse at the vast amount of variables available to us, and we also see that there is not a single NA value in the entire dataset (Yay!!). Honestly though, I've never found these functions to be all that useful. In my personal experience, I like to break the data down further through the use of visualizations and tables.
+
+```{r}
+# distributions of continuous variables
+train %>%
+  select(Elevation:Horizontal_Distance_To_Fire_Points) %>%
+  reshape2::melt() %>%
+  ggplot(aes(x = value)) +
+  geom_density() +
+  facet_wrap(~variable, scales = "free") +
+  labs(title = "Distributions of continuous variables") + 
+  theme_minimal()
+
+# count of soil types
+train %>%
+  select(Soil_Type1:Soil_Type40) %>%
+  reshape2::melt() %>%
+  group_by(variable) %>%
+  summarise(n = sum(value)) %>%
+  kableExtra::kable() %>%
+  kableExtra::kable_styling() %>%
+  kableExtra::scroll_box(width = "100%")
+
+# count of wilderness area
+train %>%
+  select(Wilderness_Area1:Wilderness_Area4) %>%
+  reshape2::melt() %>%
+  group_by(variable) %>%
+  summarise(n = sum(value)) %>%
+  kableExtra::kable() %>%
+  kableExtra::kable_styling() %>%
+  kableExtra::scroll_box(width = "100%")
+
+# vizualize distribution of cover type
+train %>%
+  group_by(Cover_Type) %>%
+  count() %>%
+  ggplot(aes(y = factor(Cover_Type), x = n)) +
+  geom_col() +
+  scale_y_discrete(labels = c("Spruce/Fir", "Lodgepole Pine", "Ponderosa Pine", "Cottonwood/Willow",
+                                                       "Aspen", "Douglas-fir", "Krummholz")) +
+  labs(title = "Number of observations in training set, by cover type",
+       y = "") +
+  theme_minimal()
+```
+
+In using visualizations and tables to explore the dataset a little further we get a better sense of the variables. For example, we see some skewness in several of the continuous variables, which is a very important thing to know and not all that easy to see with the `summary` function alone. We also see that the number of observations varies quite a bit by soil type and wilderness area. One thing that is interesting to see and might be a result of the data collection process is that the frequency of cover types happens to be exactly uniform across all cover types.
+
+Of course, one other aspect of this data exploration process is to check for data cleanliness. Issues like data errors or duplicate values can very easily lead to nefarious results and ultimately negatively impact the performance of our models. Luckily for us, the data is quite clean and the only real change we have to make is to convert the format of our response from a numeric variable to a factor variable, since we are after all dealing with a classification problem.
+
+```{r}
+train$Cover_Type <- factor(train$Cover_Type)
+```
+
+## The Modelling Process
+
+For the competition we are permitted to submit three attempts, thus we have the option to try a couple different models. Since we have more than two possible outcomes in our response variable, something like logistic regression probably would not be the best choice here and instead we might want to opt for other options. Due to the structure of the data, and because we are after all attempting to predict tree cover type, I think tree-based models are particularly applicable here. Therefore, we will fit three tree-based models: a decision tree model, a random forest model, and a boosted trees model.
+
+#### Decision Tree
+
+The first attempt will be just a standard decision tree. With a decision tree there are several hyperparameters that need tuning. These hyperparameters are how much gain in our metrics are worth it to do another split (`cost_complexity`), how many splits we will allow the tree to make (`tree_depth`), and how many observations need to be in a leaf for us to split it further (`min_n`). We will tune these metrics by first setting up a grid of possible values and then use cross validation to determine which combination of possible values leads to the best metrics. Since the Kaggle competition is ultimately evaluating performance in terms of accuracy on the test set, we will choose the hyperparameters that result in the best cross-validated accuaracy for our training set.
+
+```{r}
+# folds for cv
+train_cv <- vfold_cv(train)
+
+# hyperparameters grid
+tree_grid <- grid_regular(cost_complexity(),
+                          tree_depth(c(15,25)),
+                          min_n(), 
+                          levels = 3)
+
+# tree tuning specs
+tree_tune_spec <- decision_tree(cost_complexity = tune(),
+                          tree_depth = tune(),
+                          min_n = tune()) %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+# tree recipe
+tree_rec <- recipe(Cover_Type ~ ., data=train) %>%
+  update_role(Id, new_role = "id")
+
+# tree tuning workflow
+tree_tune_wflow <- workflow() %>%
+  add_model(tree_tune_spec) %>%
+  add_recipe(tree_rec)
+
+# tune hyperparameters
+tree_grid_search <- tune_grid(
+  tree_tune_wflow,
+  resamples = train_cv,
+  grid = tree_grid
+  )
+
+# determine best hyperparameters by accuracy
+tree_grid_search %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  arrange(desc(mean)) %>%
+  kableExtra::kable() %>%
+  kableExtra::kable_styling() %>%
+  kableExtra::scroll_box(width = "100%")
+```
+
+Its pretty clear that a complex tree leads to the best results. In fact a decision tree with the a cost complexity of 1e-10, a tree depth of 15 and a minimum a number of values required to split a leaf further of 2 leads to the best cross-validated accuracy at 79.8%. Now that we have our hyperparameters, we can fit our final decision tree model on the whole training set.
+
+```{r}
+# select best hyperparameters
+tree_best_acc <- select_best(tree_grid_search, "accuracy")
+
+# final tree specs
+tree_spec <- finalize_model(
+  tree_tune_spec,
+  tree_best_acc
+  )
+
+# final tree workflow
+tree_wflow <- workflow() %>%
+  add_model(tree_spec) %>%
+  add_recipe(tree_rec)
+
+# final fit
+tree_final_fit <- tree_wflow %>%
+  fit(train)
+```
+
+Alright, now we have our final fitted decision tree. At this point I would normally plot the actual decision tree. However, our tree is quite complex and so there is no sense in attempting to visualize the whole thing. Instead, lets take a look at the most important variables for predicting cover type.
+
+```{r}
+library(vip)
+
+# visualize most important variables
+tree_final_fit %>%
+  pull_workflow_fit() %>%
+  vip(geom="col") +
+  theme_minimal()
+```
+
+As we can see, elevation is the most important predictor of cover type by quite a wide margin. Intuitively, this would make a lot of sense because I am sure we have all often noticed how much nature can differ at various levels of elevation. We also see that predictors like the horizontal distances to roadways and fire points have some importance as well, however not nearly as much as elevation does. Now that we have our final decision tree and a sense for what variables are most important, lets move on to our next model: a random forest.
+
+#### Random Forest
+
+The next model we will attempt to fit will be a random forest. For this model we have two hyperparameters to tune: the number of observations needed to further split a leaf (`min_n`) and the number of predictors to sample at each split (`mtry`). We will once again be using the same process as above to tune our hyperparameters.
+
+```{r}
+# number of cores for parallel processing
+cores <- parallel::detectCores()
+
+# rf tuning specifications
+rf_tune_spec <- rand_forest(min_n = tune(), mtry = tune()) %>%
+  set_engine("ranger", num.threads = cores) %>%
+  set_mode("classification")
+
+# rf recipe (same as tree_rec)
+rf_rec <- tree_rec
+
+# rf tuning workflow
+rf_tune_wflow <- workflow() %>%
+  add_model(rf_tune_spec) %>%
+  add_recipe(rf_rec)
+
+# tune hyperparameters
+rf_grid_search <- tune_grid(
+  rf_tune_wflow,
+  resamples = train_cv,
+  grid = 10
+  )
+
+# determine best hyperparameters by accuracy
+rf_grid_search %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  arrange(desc(mean)) %>%
+  kableExtra::kable() %>%
+  kableExtra::kable_styling() %>%
+  kableExtra::scroll_box(width = "100%")
+```
+
+The random forest with 53 predictors being sampled at each split and at least 3 observations needed to keep splitting nodes results in a cross-validated accuracy of 86.2%, which is much higher than the cross-validated accuracy acheived with the decision tree. As we did with our decision tree, lets fit the final model and then visualize the most important variables.
+
+```{r}
+# select best hyperparameters
+rf_best_acc <- select_best(rf_grid_search, "accuracy")
+
+# final rf specifications
+rf_spec <- finalize_model(
+  rf_tune_spec,
+  rf_best_acc
+  ) %>%
+  set_engine("ranger", importance = "permutation")
+
+# final rf workflow
+rf_wflow <- workflow() %>%
+  add_model(rf_spec) %>%
+  add_recipe(rf_rec)
+
+# final rf fit
+rf_final_fit <- rf_wflow %>%
+  fit(train)
+
+# visualize most important variables
+rf_final_fit %>%
+  pull_workflow_fit() %>%
+  vip(geom = "col") +
+  theme_minimal()
+```
+
+When looking at the most important variables for the random forest, we get a pretty similar ranking in terms of most important variables. However, relative to the other variables, elevation is much more important for the random forest as compared to the decision tree. Since we have a sense now for the important variables in our random forest model, lets try to fit a boosted trees model.
+
+#### Boosted Trees
+
+The final modeling technique we will try is a method that is quite similar to random forests known as boosted decision trees, in which gradient boosting is used to minimize loss when adding new models. Boosted trees have a bunch more hyperparameters as compared to decision trees or random forests. These hyperparameters are:
+
+* `tree_depth`: The maximum allowed depth of the tree.
+* `min_n`: The minimum number of observations required for a node to split further.
+* `loss_reduction`: The reduction in loss function that is needed to split further.
+* `sample_size`: The proportion of the data that is exposed to the fitting routine.
+* `mtry`: The number of predictors to sample at each split.
+* `learn_rate`: The rate at which the boosting algorithm changes from iteration to iteration.
+
+
+To tune these parameter effectively, it would ultimately require a lot of computing power using the standard regular grid method that we previously used. So in this instance I used a space filling design for my grid with a size of 20 which hopefully accounts for a solid range of possible values. Beyond that, the workflow for tuning the hyperparameters and fitting the final model is pretty much the same as we have seen with the last two models.
+
+```{r}
+# grid
+xgb_grid <- grid_latin_hypercube(
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), train),
+  learn_rate(),
+  size = 30
+)
+
+?grid_latin_hypercube
+?grid_max_entropy
+
+# xgb tuning specs
+xgb_tune_spec <- boost_tree(
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry = tune(),
+  learn_rate = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+# xgb recipe (same as rf/tree rec)
+xgb_rec <- rf_rec
+
+# xgb workflow
+xgb_tune_wflow <- workflow() %>%
+  add_model(xgb_tune_spec) %>%
+  add_recipe(xgb_rec)
+
+# tune hyperparameters
+xgb_grid_search <- tune_grid(
+  xgb_tune_wflow,
+  resamples = train_cv,
+  grid = xgb_grid
+)
+
+# hyperparamteters that result in best accuracy
+xgb_grid_search %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  arrange(desc(mean)) %>% 
+  kableExtra::kable() %>%
+  kableExtra::kable_styling() %>%
+  kableExtra::scroll_box(width = "100%")
+```
+
+A boosted tree with the following hyperparameters ultimately results in the best cross-validated accuracy at 74.9% (the lowest of the three models):
+
+* `tree_depth`: 8
+* `min_n`: 8
+* `loss_reduction`: 3.29e-10
+* `sample_size`: 0.426
+* `mtry`: 22
+* `learn_rate`: 3.63e-5
+
+Now that we have our hyperparameters tuned, lets move onto visualizing the most important variables.
+
+
+```{r}
+# select best hyperparameters
+xgb_best_acc <- select_best(xgb_grid_search, metric = "accuracy")
+
+# final xgb specifications
+xgb_spec <- finalize_model(
+  xgb_tune_spec,
+  xgb_best_acc
+)
+
+# final xgb workflow
+xgb_wflow <- workflow() %>%
+  add_model(xgb_spec) %>%
+  add_recipe(xgb_rec)
+
+# fit final xgb model
+xgb_final_fit <- xgb_wflow %>%
+  fit(train)
+
+# visualize most important variables
+xgb_final_fit %>%
+  pull_workflow_fit() %>%
+  vip(geom = "col") +
+  theme_minimal()
+```
+
+As we have seen before with our previous models, elevation is the most important variable but this time it is even more, relatively speaking, important as compared to the other models. We also seem to see a slightly different ordering for the rest of the variables as compared to the other models, but the usual suspects are still there.
+
+## Predicting on the Test set
+
+Now that we have fit our models with the training data, all that is left to do is make predictions on the test set and save them in the appropriate format for Kaggle.
+
+```{r}
+# read in test data
+test <- read_csv("./Data/test.csv")
+
+# make predictions for each model
+tree_preds <- data.frame(Id = test$Id,
+                         Cover_Type = predict(tree_final_fit, new_data = test)$.pred_class)
+rf_preds <- data.frame(Id = test$Id,
+                       Cover_Type = predict(rf_final_fit, new_data = test)$.pred_class)
+xgb_preds <- data.frame(Id = test$Id,
+                        Cover_Type = predict(xgb_final_fit, new_data = test)$.pred_class)
+
+# write csv files for Kaggle
+write.csv(tree_preds, "./Predictions/tree_preds.csv")
+write.csv(rf_preds, "./Predictions/rf_preds.csv")
+write.csv(xgb_preds, "./Predictions/xgb_preds.csv")
+```
+
+And voila! Now that we have our predictions in a submittable format for Kaggle, our modeling process is complete and we are ready to submit our results to Kaggle and see how we did.
+
+## Final Results and Conclusion
+
+The final results for the three models:
+
+* Random Forest: 74.4%
+* Decision Tree: 73.7%
+* Boosted Trees: 60.1%
+
+In terms of the final results on the test set, we ended up getting the same ordering in terms of accuracy as we did during cross-validation on the training set. However, no model performed as well on the test data as our cross-validated metrics projected. Altouhg, the random forest and decision tree did get at least 70% of the predictions right which I think is pretty solid considering we are using a dataset of about 15,000 observations to make predictions for about 570,000 other observations. Unfortunately though, the boosted tree model was disappointingly poor in terms of accuracy on the test set with an accuracy of only 60.1%. I think one possible reason for this result is that we simply did not have the possible values available for tuning the hyperparameters and so our hyperparameters are simply wrong. In fact, in reading about boosted trees, I have read that it can be quite easy to overfit on the training data, especially if the hyperparameters aren't tuned correctly, and so there might be better ways to account for this as well. Nonetheless, boosted trees are a relatively new concept to me and I am excited to learn how I can improve upon their performance in the future.
+
+## Conclusion
+
+In participating in this Kaggle competition and attempting to predict tree cover type, we were able to take a step-by-step look at my general modeling process. We first explored the training set and made any necessary changes to the training set, then we fit several tree-based models on that training set, and finally we made predictions on the test/validation set. In fitting all three of the models we followed the same general modeling process. We first tuned our hyperparameters through the use of cross-validation, then we fit our final model on the full training set, and finally made predictions on the test set. Ultimately, in going through this modeling competition and outlining my process I feel like I learned a lot about statistical learning and I hope the readers of this report do as well.
+
